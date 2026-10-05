@@ -1,0 +1,17 @@
+# Compiled executables
+rbc_server
+evc_client
+
+# Object files
+*.o
+
+# Backup files
+*~
+*.bak
+
+# Editor / IDE
+.vscode/
+.idea/
+
+# OS files
+.DS_Store
