@@ -59,6 +59,9 @@ void *handle_evc(void *arg)
     uint32_t last_state_sequence = 0;
 
     int first_state_received = 0;
+    uint32_t bound_train_id = 0;
+    uint32_t last_request_sequence = 0;
+    int first_request_received = 0;
 
 
     printf(
@@ -70,260 +73,115 @@ void *handle_evc(void *arg)
 
     while (1) {
 
-        /* -----------------------------------------
-           Receive TrainState
-           ----------------------------------------- */
-
-        ssize_t n = recv_line(
-            client_fd,
-            buffer,
-            sizeof(buffer)
-        );
-
-
+        ssize_t n = recv_line(client_fd, buffer, sizeof(buffer));
         if (n == 0) {
-
-            printf(
-                "[RBC] EVC disconnected "
-                "(socket=%d)\n",
-                client_fd
-            );
-
+            printf("[RBC] EVC disconnected (socket=%d)\n", client_fd);
             break;
         }
-
-
         if (n < 0) {
-
             perror("[RBC] recv");
             break;
         }
 
-
-        /* -----------------------------------------
-           Parse TrainState
-           ----------------------------------------- */
-
-        TrainState state;
-
-        if (parse_train_state(buffer, &state) < 0) {
-
-            printf(
-                "[RBC] Invalid STATE "
-                "(socket=%d)\n",
-                client_fd
-            );
-
-            continue;
-        }
-
-
-        printf(
-            "\n[RBC] STATE received "
-            "train=%u seq=%u "
-            "pos=%.2f speed=%.2f\n",
-            state.train_id,
-            state.sequence_number,
-            state.position,
-            state.speed
-        );
-
-
-        /* -----------------------------------------
-           Sequence number check
-           ----------------------------------------- */
-
-        if (!first_state_received) {
-
-            last_state_sequence =
-                state.sequence_number;
-
+        if (strncmp(buffer, "STATE;", 6) == 0) {
+            TrainState state;
+            if (parse_train_state(buffer, &state) < 0) {
+                printf("[RBC] Invalid STATE (socket=%d)\n", client_fd);
+                continue;
+            }
+            if (state.train_id < 1 || state.train_id > MAX_EVC) {
+                printf("[RBC] Invalid train_id: %u\n", state.train_id);
+                continue;
+            }
+            if (bound_train_id != 0 && state.train_id != bound_train_id) {
+                printf("[RBC] STATE rejected: train_id differs from connection identity\n");
+                continue;
+            }
+            if (first_state_received) {
+                if (state.sequence_number <= last_state_sequence) {
+                    printf("[RBC] STATE rejected: duplicate/old sequence\n");
+                    continue;
+                }
+                if (state.sequence_number > last_state_sequence + 1) {
+                    printf("[RBC] WARNING: STATE sequence gap (expected %u, received %u)\n",
+                           last_state_sequence + 1, state.sequence_number);
+                }
+            }
+            double message_age = get_timestamp() - state.timestamp;
+            printf("[RBC] STATE train=%u seq=%u pos=%.2f speed=%.2f age=%.3f ms\n",
+                   state.train_id, state.sequence_number, state.position,
+                   state.speed, message_age * 1000.0);
+            if (message_age > T_MAX_AGE) {
+                printf("[RBC] STATE rejected: message too old\n");
+                continue;
+            }
+            /* Keep the first accepted STATE as the connection identity. */
+            if (rbc_context_update(context, &state) < 0) {
+                printf("[RBC] Cannot update context for Train %u\n", state.train_id);
+                continue;
+            }
+            if (bound_train_id == 0) bound_train_id = state.train_id;
+            last_state_sequence = state.sequence_number;
             first_state_received = 1;
-
+            rbc_context_print(context);
+            rbc_context_print_interdistances(context);
+            /* STATE does not trigger a Movement Authority response. */
+        } else if (strncmp(buffer, "MA_REQUEST;", 11) == 0) {
+            MARequest request;
+            if (parse_ma_request(buffer, &request) < 0) {
+                printf("[RBC] Invalid MA_REQUEST\n");
+                continue;
+            }
+            if (bound_train_id == 0 || request.train_id != bound_train_id) {
+                printf("[RBC] MA_REQUEST rejected: no bound STATE or wrong train_id\n");
+                continue;
+            }
+            if (first_request_received &&
+                request.sequence_number <= last_request_sequence) {
+                printf("[RBC] MA_REQUEST rejected: duplicate/old sequence\n");
+                continue;
+            }
+            double request_age = get_timestamp() - request.timestamp;
+            if (request_age > T_MAX_AGE) {
+                printf("[RBC] MA_REQUEST rejected: message too old\n");
+                continue;
+            }
+            /* V1.7: check that this train has a state in RBCContext.
+               A separate per-train freshness check is still needed before
+               using cached states for safety-critical MA computation. */
+            pthread_mutex_lock(&context->mutex);
+            int state_available = context->valid[request.train_id - 1];
+            pthread_mutex_unlock(&context->mutex);
+            if (!state_available) {
+                printf("[RBC] MA_REQUEST rejected: no valid STATE\n");
+                continue;
+            }
+            last_request_sequence = request.sequence_number;
+            first_request_received = 1;
+            printf("[RBC] MA_REQUEST train=%u seq=%u\n",
+                   request.train_id, request.sequence_number);
+            MovementAuthority ma = {0};
+            if (generate_ma(context, request.train_id, &ma) < 0) {
+                printf("[RBC] Cannot generate MA for Train %u\n", request.train_id);
+                continue;
+            }
+            ma.sequence_number = ++ma_sequence_number;
+            ma.timestamp = get_timestamp();
+            char ma_buffer[MESSAGE_SIZE];
+            int message_length = serialize_ma(&ma, ma_buffer, sizeof(ma_buffer));
+            if (message_length < 0) {
+                printf("[RBC] MA serialization error\n");
+                continue;
+            }
+            if (send_all(client_fd, ma_buffer, (size_t)message_length) < 0) {
+                perror("[RBC] send");
+                break;
+            }
+            printf("[RBC] MA sent train=%u seq=%u limit=%.2f vmax=%.2f\n",
+                   ma.train_id, ma.sequence_number, ma.movement_limit, ma.vmax);
         } else {
-
-            if (state.sequence_number ==
-                last_state_sequence) {
-
-                printf(
-                    "[RBC] STATE rejected: "
-                    "duplicate sequence number\n"
-                );
-
-                continue;
-            }
-
-
-            if (state.sequence_number <
-                last_state_sequence) {
-
-                printf(
-                    "[RBC] STATE rejected: "
-                    "old sequence number\n"
-                );
-
-                continue;
-            }
-
-
-            if (state.sequence_number >
-                last_state_sequence + 1) {
-
-                printf(
-                    "[RBC] WARNING: sequence gap "
-                    "(expected %u, received %u)\n",
-                    last_state_sequence + 1,
-                    state.sequence_number
-                );
-            }
-
-
-            last_state_sequence =
-                state.sequence_number;
+            printf("[RBC] Unknown message type (socket=%d): %s\n", client_fd, buffer);
         }
-
-
-        /* -----------------------------------------
-           Freshness check
-           ----------------------------------------- */
-
-        double reception_time = get_timestamp();
-
-        double message_age =
-            reception_time - state.timestamp;
-
-
-        printf(
-            "[RBC] Message age = %.3f ms\n",
-            message_age * 1000.0
-        );
-
-
-        if (message_age > T_MAX_AGE) {
-
-            printf(
-                "[RBC] STATE rejected: "
-                "message too old\n"
-            );
-
-            continue;
-        }
-
-	/* -----------------------------------------
-	   Update RBC shared context
-	   ----------------------------------------- */
-
-	if (state.train_id < 1 ||
-	    state.train_id > MAX_EVC) {
-
-	    printf(
-		"[RBC] Invalid train_id: %u\n",
-		state.train_id
-	    );
-
-	    continue;
-	}
-
-
-
-
-	if (rbc_context_update(
-		context,
-		&state
-	    ) < 0) {
-
-	    printf(
-		"[RBC] Cannot update context "
-		"for Train %u\n",
-		state.train_id
-	    );
-
-	    continue;
-	}
-
-
-	rbc_context_print(context);
-
-	rbc_context_print_interdistances(context);
-
-        /* -----------------------------------------
-           Generate simulated MA
-           ----------------------------------------- */
-
-	MovementAuthority ma;
-
-
-	int ma_result =
-	    generate_ma(
-		context,
-		state.train_id,
-		&ma
-	    );
-
-
-
-	if (ma_result < 0) {
-
-	    printf(
-		"[RBC] Cannot generate MA "
-		"for Train %u\n",
-		state.train_id
-	    );
-
-	    continue;
-	}
-
-
-	ma.sequence_number =
-	    ++ma_sequence_number;
-
-
-        /* -----------------------------------------
-           Serialize MA
-           ----------------------------------------- */
-
-        int message_length =
-            serialize_ma(
-                &ma,
-                buffer,
-                sizeof(buffer)
-            );
-
-
-        if (message_length < 0) {
-
-            printf(
-                "[RBC] MA serialization error\n"
-            );
-
-            continue;
-        }
-
-
-        /* -----------------------------------------
-           Send MA
-           ----------------------------------------- */
-
-        if (send_all(
-                client_fd,
-                buffer,
-                (size_t)message_length
-            ) < 0) {
-
-            perror("[RBC] send");
-            break;
-        }
-
-
-        printf(
-            "[RBC] MA sent "
-            "train=%u seq=%u "
-            "limit=%.2f vmax=%.2f\n",
-            ma.train_id,
-            ma.sequence_number,
-            ma.movement_limit,
-            ma.vmax
-        );
     }
 
 

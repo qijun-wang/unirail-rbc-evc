@@ -227,6 +227,7 @@ int main(int argc, char *argv[])
        ========================================== */
 
     TrainState state;
+    uint32_t request_sequence_number = 0;
 
 
     state.train_id =
@@ -371,6 +372,38 @@ int main(int argc, char *argv[])
             state.speed
         );
 
+
+        /* --------------------------------------
+           V1.7: Request a new Movement Authority
+
+           Test policy: one MA_REQUEST per cycle.
+           The final braking-curve trigger belongs
+           to the control/safety integration.
+           -------------------------------------- */
+
+        MARequest request = {0};
+        request.train_id = train_id;
+        request.sequence_number = ++request_sequence_number;
+        request.timestamp = get_timestamp();
+
+        message_length = serialize_ma_request(
+            &request, buffer, sizeof(buffer)
+        );
+
+        if (message_length < 0) {
+            fprintf(stderr,
+                    "[EVC %u] Failed to serialize MA_REQUEST.\n",
+                    train_id);
+            break;
+        }
+
+        if (send_all(socket_fd, buffer, (size_t)message_length) != 0) {
+            perror("[EVC] send MA_REQUEST");
+            break;
+        }
+
+        printf("[EVC %u] MA_REQUEST sent seq=%u\n",
+               train_id, request.sequence_number);
 
         /* --------------------------------------
            Receive MA

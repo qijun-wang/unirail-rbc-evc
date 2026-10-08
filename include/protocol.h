@@ -24,6 +24,12 @@ typedef struct {
     double vmax;
 } MovementAuthority;
 
+/* EVC -> RBC : Movement Authority Request */
+typedef struct {
+    uint32_t train_id;
+    uint32_t sequence_number;
+    double timestamp;
+} MARequest;
 
 /* Serialization */
 int serialize_train_state(
@@ -36,6 +42,19 @@ int serialize_ma(
     const MovementAuthority *ma,
     char *buffer,
     size_t buffer_size
+);
+
+/* MA Request serialization */
+int serialize_ma_request(
+    const MARequest *request,
+    char *buffer,
+    size_t buffer_size
+);
+
+/* MA Request parsing */
+int parse_ma_request(
+    const char *buffer,
+    MARequest *request
 );
 
 
